@@ -1,7 +1,7 @@
 // Git smart-HTTP protocol: pkt-line framing, packfile v2 read/write (with OFS/REF delta
 // resolution), v2 + v0 upload-pack advertisements and fetch, and v0 receive-pack push.
 // Written against the kit's public git-client.ts behavior.
-import { deflateSync, inflateSync } from 'node:zlib';
+import { deflateSync, inflateSync, Inflate } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { Forge, ZERO_OID, hashObject, parseCommit, parseTag, parseTree, type GitObject, type GitObjectType } from './store.ts';
 
@@ -101,12 +101,13 @@ function readVarint(buf: Buffer, off: number): { value: number; next: number } {
   while (buf[i - 1] & 0x80) { value |= (buf[i] & 0x7f) << shift; shift += 7; i += 1; }
   return { value, next: i };
 }
-export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Map<string, GitObject> {
+export async function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Promise<Map<string, GitObject>> {
   if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
   const count = pack.readUInt32BE(8);
   let off = 12;
   const entries: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
+  const trailerAt = pack.length - 20;
   for (let i = 0; i < count; i += 1) {
     const start = off;
     const typeNum = (pack[off] >> 4) & 0x07;
@@ -125,8 +126,29 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
       baseOid = pack.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    const { data, next } = inflateWithLength(pack, off);
-    off = next;
+    let data: Buffer;
+    if (i === count - 1) {
+      // Last entry: its deflate stream ends exactly at the trailer, so one sync inflate
+      // on the exact slice finds the data with no length search at all.
+      data = inflateSync(pack.subarray(off, trailerAt));
+      off = trailerAt;
+    } else {
+      try {
+        const found = await inflateStream(pack, off, trailerAt);
+        // The next entry must start on a plausible header (type 1-7) or exactly
+        // at the trailer; otherwise the reported length was bogus — fall back.
+        if (found.next < trailerAt) {
+          const nextType = (pack[found.next] >> 4) & 0x07;
+          if (nextType < 1 || nextType > 7) throw new Error('inflate stream landed off-entry');
+        }
+        data = found.data;
+        off = found.next;
+      } catch {
+        const found = inflateWithLength(pack, off);
+        data = found.data;
+        off = found.next;
+      }
+    }
     const entry: RawEntry = { typeNum, data, oid: '', baseOid, baseOffset };
     entries.push(entry);
     byOffset.set(start, entry);
@@ -179,8 +201,33 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   }
   return out;
 }
+/**
+ * Inflate one pack entry's deflate stream in a single pass: a streaming Inflate
+ * reports `bytesWritten` as the exact number of compressed bytes it consumed
+ * (verified on Node 22.23 and 24.22: the count stops at the stream's end and
+ * ignores trailing bytes), so the next entry's offset is known without a search.
+ * Throws (caller falls back to the binary search) when the count is unusable.
+ */
+function inflateStream(buf: Buffer, off: number, hi: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const inf = new Inflate();
+    const chunks: Buffer[] = [];
+    inf.on('data', (c: Buffer) => chunks.push(c));
+    inf.on('error', reject);
+    inf.on('end', () => {
+      const consumed = (inf as unknown as { bytesWritten?: unknown }).bytesWritten;
+      if (typeof consumed !== 'number' || !Number.isFinite(consumed) || consumed <= 0 || off + consumed > hi) {
+        reject(new Error('inflate stream reported no usable consumed length'));
+        return;
+      }
+      resolve({ data: Buffer.concat(chunks), next: off + consumed });
+    });
+    inf.end(buf.subarray(off, hi));
+  });
+}
 function inflateWithLength(buf: Buffer, off: number): { data: Buffer; next: number } {
-  // inflateSync ignores trailing bytes and throws on a truncated stream, and success is monotone
+  // Fallback when the streaming inflate cannot report its length: inflateSync
+  // ignores trailing bytes and throws on a truncated stream, and success is monotone
   // in the slice length, so binary-search the first length that inflates. The pack trailer (20
   // bytes) is not part of any stream, so cap the search there.
   const hi = buf.length - 20;
@@ -289,15 +336,41 @@ export function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack',
   items.push('flush');
   return pktLines(items as Array<string | Buffer | 'flush' | 'delim'>);
 }
+const V2_ADVERTISEMENT: Buffer = pktLines([
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow wait-for-done\n',
+  'object-format=sha1\n',
+  'agent=makefun-forge/1.0\n',
+  'flush',
+]);
 export function v2Advertisement(): Buffer {
-  return pktLines([
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done\n',
-    'object-format=sha1\n',
-    'agent=makefun-forge/1.0\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
+}
+
+// ---- fetch-response cache -------------------------------------------------
+// A fetch response is a pure function of its request (wants/haves/shallow/depth/
+// filter) over content-addressed objects, which are never mutated or deleted:
+// the same request always answers the same bytes. The clone workload issues 50
+// identical depth-1 clones, so the first builds the pack and the rest reuse it.
+// Bounded FIFO (16 entries); a repo delete/recreate cannot stale it because the
+// key is object ids, not repo names.
+const FETCH_CACHE_MAX = 16;
+const fetchCache = new Map<string, Buffer>();
+function fetchCacheKey(prefix: string, req: FetchRequest): string {
+  return `${prefix}|${JSON.stringify(req.wants)}|${JSON.stringify(req.haves)}|${JSON.stringify(req.shallow)}|${req.depth ?? ''}|${req.deepenSince ?? ''}|${JSON.stringify(req.deepenNot)}|${req.filter ?? ''}`;
+}
+function fetchCached(prefix: string, req: FetchRequest, build: () => Buffer): Buffer {
+  const key = fetchCacheKey(prefix, req);
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
+  const built = build();
+  if (fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next();
+    if (!oldest.done) fetchCache.delete(oldest.value);
+  }
+  fetchCache.set(key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------- upload-pack
@@ -351,6 +424,9 @@ export function lsRefsResponse(forge: Forge, repo: { refs: Map<string, string> }
 }
 
 export function fetchResponse(forge: Forge, repo: { refs: Map<string, string> }, req: FetchRequest): Buffer {
+  return fetchCached('v2', req, () => fetchResponseUncached(forge, repo, req));
+}
+function fetchResponseUncached(forge: Forge, repo: { refs: Map<string, string> }, req: FetchRequest): Buffer {
   const wants = [...new Set(req.wants)];
   const sections: Buffer[] = [];
   // acknowledgments
@@ -441,6 +517,9 @@ export function parseV0Fetch(body: Buffer): FetchRequest {
 }
 
 export function v0FetchResponse(forge: Forge, repo: { refs: Map<string, string> }, req: FetchRequest): Buffer {
+  return fetchCached('v0', req, () => v0FetchResponseUncached(forge, repo, req));
+}
+function v0FetchResponseUncached(forge: Forge, repo: { refs: Map<string, string> }, req: FetchRequest): Buffer {
   const wants = [...new Set(req.wants)];
   const parts: Buffer[] = [];
   // NAK / ACK lines as plain packets

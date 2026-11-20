@@ -37,6 +37,15 @@ export function err(status: number, message: string): Resp {
 const nowIso = (): string => new Date().toISOString();
 /** User rows are near-static: one timestamp for the process keeps issue payloads cacheable. */
 const USER_UPDATED_AT = new Date().toISOString();
+function userJson(u: typeof VIEWER) {
+  return {
+    login: u.login, id: u.id, node_id: b64url(`U:${u.login}`), avatar_url: '',
+    type: 'User', site_admin: false, html_url: `https://github.com/${u.login}`,
+    url: `/api/v3/users/${u.login}`, created_at: '2025-01-01T00:00:00Z', updated_at: USER_UPDATED_AT,
+  };
+}
+/** The viewer row never changes: build it once, reuse it in every payload. */
+const VIEWER_JSON = userJson(VIEWER);
 
 // ---- cached single-issue payloads (bench read hits the same issue 2,000x)
 // Keyed owner/repo#number; invalidated on every mutation of that issue (PATCH,
@@ -61,17 +70,10 @@ function cachedIssueJson(ctx: Ctx, r: Repo, i: Issue): Resp {
 }
 
 // ---- shapes
-function userJson(u: typeof VIEWER) {
-  return {
-    login: u.login, id: u.id, node_id: b64url(`U:${u.login}`), avatar_url: '',
-    type: 'User', site_admin: false, html_url: `https://github.com/${u.login}`,
-    url: `/api/v3/users/${u.login}`, created_at: '2025-01-01T00:00:00Z', updated_at: USER_UPDATED_AT,
-  };
-}
 function repoJson(ctx: Ctx, r: Repo) {
   return {
     id: r.id, node_id: b64url(`R:${r.owner}/${r.name}`), name: r.name, full_name: `${r.owner}/${r.name}`,
-    owner: userJson(VIEWER), private: r.isPrivate, html_url: `https://github.com/${r.owner}/${r.name}`,
+    owner: VIEWER_JSON, private: r.isPrivate, html_url: `https://github.com/${r.owner}/${r.name}`,
     description: r.description, fork: false, url: `/api/v3/repos/${r.owner}/${r.name}`,
     created_at: r.createdAt, updated_at: r.updatedAt, pushed_at: r.updatedAt,
     git_url: `git://github.com/${r.owner}/${r.name}.git`,
@@ -95,7 +97,7 @@ function issueJson(ctx: Ctx, r: Repo, i: Issue) {
     repository_url: `/api/v3/repos/${r.owner}/${r.name}`,
     html_url: `https://github.com/${r.owner}/${r.name}/issues/${i.number}`,
     number: i.number, title: i.title, body: i.body, state: i.state,
-    user: userJson(VIEWER), labels: i.labels.map((name) => labelJson(r.labels.get(name) ?? { name, color: 'ededed' })),
+    user: VIEWER_JSON, labels: i.labels.map((name) => labelJson(r.labels.get(name) ?? { name, color: 'ededed' })),
     assignee: null, assignees: [], locked: false, comments: i.comments.length,
     created_at: i.createdAt, updated_at: i.updatedAt, closed_at: i.closedAt,
     author_association: 'OWNER', active_lock_reason: null,
@@ -107,9 +109,9 @@ function prJson(ctx: Ctx, r: Repo, p: PullRequest) {
     url: `/api/v3/repos/${r.owner}/${r.name}/pulls/${p.number}`,
     html_url: `https://github.com/${r.owner}/${r.name}/pull/${p.number}`,
     number: p.number, title: p.title, body: p.body, state: p.state,
-    user: userJson(VIEWER), locked: false,
-    head: { label: `${r.owner}:${p.headRef}`, ref: p.headRef, sha: p.headSha, user: userJson(VIEWER), repo: repoJson(ctx, r) },
-    base: { label: `${r.owner}:${p.baseRef}`, ref: p.baseRef, sha: p.baseSha, user: userJson(VIEWER), repo: repoJson(ctx, r) },
+    user: VIEWER_JSON, locked: false,
+    head: { label: `${r.owner}:${p.headRef}`, ref: p.headRef, sha: p.headSha, user: VIEWER_JSON, repo: repoJson(ctx, r) },
+    base: { label: `${r.owner}:${p.baseRef}`, ref: p.baseRef, sha: p.baseSha, user: VIEWER_JSON, repo: repoJson(ctx, r) },
     merged: p.merged, mergeable: !p.merged && !ctx.forge.mergeConflict(p.baseShaAtCreate, p.headSha, p.baseSha),
     mergeable_state: p.merged ? 'merged' : 'clean', merged_at: p.mergedAt, merge_commit_sha: p.mergeCommitSha,
     draft: false, created_at: p.createdAt, updated_at: p.updatedAt, closed_at: p.state === 'closed' ? p.updatedAt : null,
@@ -180,7 +182,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
   }
   // /user
   if (rest[0] === 'user') {
-    if (rest.length === 1 && req.method === 'GET') return json(200, userJson(VIEWER));
+    if (rest.length === 1 && req.method === 'GET') return json(200, VIEWER_JSON);
     if (rest.length === 2 && rest[1] === 'repos') {
       if (req.method === 'GET') return paginate(ctx, req, forge.listViewerRepos().map((r) => repoJson(ctx, r)));
       if (req.method === 'POST') {
@@ -246,7 +248,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
           committer: { name: VIEWER.name, email: VIEWER.email, date: new Date(info.committerTime * 1000).toISOString() },
           tree: { sha: info.tree },
         },
-        author: userJson(VIEWER), committer: userJson(VIEWER),
+        author: VIEWER_JSON, committer: VIEWER_JSON,
         parents: info.parents.map((p) => ({ sha: p })),
       }));
       return paginate(ctx, req, commits);
@@ -440,7 +442,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
           dropIssuePayload(repo.owner, repo.name, issue.number);
           return json(201, {
             id, node_id: b64url(`CM:${repo.owner}/${repo.name}#${issue.number}/${id}`),
-            url: '', html_url: '', body, user: userJson(VIEWER),
+            url: '', html_url: '', body, user: VIEWER_JSON,
             created_at: comment.createdAt, updated_at: comment.createdAt, author_association: 'OWNER',
           });
         }

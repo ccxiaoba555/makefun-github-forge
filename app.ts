@@ -10,6 +10,10 @@ import {
   readPack, verifyPackChecksum,
 } from './gitproto.ts';
 
+/** Shared empty values for the no-query / no-body fast paths: handlers only read them. */
+const EMPTY_QUERY = new URLSearchParams();
+const EMPTY_BODY = Buffer.alloc(0);
+
 export function createApp(): ReturnType<typeof createServer> {
   const forge = new Forge();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -59,8 +63,12 @@ export function createApp(): ReturnType<typeof createServer> {
       const rawUrl = req.url ?? '/';
       const qi = rawUrl.indexOf('?');
       const path = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
-      const query = qi < 0 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qi + 1));
+      // No query string is the common case (bench read/write): reuse one empty
+      // params object instead of building one per request. Handlers only read it.
+      const query = qi < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qi + 1));
       const method = req.method ?? 'GET';
+      // GET/HEAD carry no body in this protocol: skip the readBody round-trip.
+      const noBody = method === 'GET' || method === 'HEAD';
 
       // healthz: no auth, plain 200
       if (path === '/healthz') {
@@ -76,7 +84,7 @@ export function createApp(): ReturnType<typeof createServer> {
         if (!authorized(req)) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
         const repo = forge.getRepo(owner, repoName);
         if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
-        const body = await readBody(req);
+        const body = noBody ? EMPTY_BODY : await readBody(req);
         if (rest === 'info/refs' && method === 'GET') {
           const service = query.get('service') ?? '';
           if (service === 'git-upload-pack') {
@@ -131,7 +139,7 @@ export function createApp(): ReturnType<typeof createServer> {
           if (pack.length > 0) {
             try {
               if (!verifyPackChecksum(pack)) throw new Error('pack checksum mismatch');
-              packObjects = readPack(pack, (oid) => forge.getObject(oid));
+          packObjects = await readPack(pack, (oid) => forge.getObject(oid));
             } catch (e) {
               unpackOk = false;
               unpackDetail = e instanceof Error ? e.message : String(e);
@@ -151,7 +159,7 @@ export function createApp(): ReturnType<typeof createServer> {
       // API surfaces need auth
       if (path === '/api/graphql' || path === '/mcp' || path.startsWith('/api/v3')) {
         if (!authorized(req)) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
-        const body = await readBody(req);
+        const body = noBody ? EMPTY_BODY : await readBody(req);
         let parsed: unknown;
         let bodyInvalid = false;
         if (body.length) {
@@ -172,7 +180,7 @@ export function createApp(): ReturnType<typeof createServer> {
           sendJson(res, out.status, out.body, out.headers);
           return;
         }
-        // /api/v3/*
+        // /api/v3/* — handleRest never reads headers, so skip copying them.
         const ctxReq: Req = {
           method,
           path,
@@ -181,7 +189,6 @@ export function createApp(): ReturnType<typeof createServer> {
           body: parsed,
           bodyInvalid,
         };
-        for (const [k, v] of Object.entries(req.headers)) ctxReq.headers[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;
         const out = handleRest({ forge, baseUrl: baseUrlOf(req) }, ctxReq);
         const extra: Record<string, string> = { ...(out.headers ?? {}) };
         if (path === '/api/v3' || path === '/api/v3/') extra['X-Oauth-Scopes'] = 'repo, read:org';
