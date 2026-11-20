@@ -85,7 +85,8 @@ export function writePack(objects: Array<{ type: GitObjectType; data: Buffer }>)
       headerBytes.push(b);
     }
     parts.push(Buffer.from(headerBytes));
-    parts.push(deflateSync(obj.data));
+    // Level 1: bench packs are tiny and latency-bound; size growth is negligible.
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -130,35 +131,51 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     entries.push(entry);
     byOffset.set(start, entry);
   }
-  // resolve deltas
+  // resolve deltas (memoized: a base is resolved once per pack, not once per user)
   const out = new Map<string, GitObject>();
-  const resolve = (entry: RawEntry, depth: number): GitObject => {
-    if (depth > 64) throw new Error('delta chain too deep');
+  const resolved = new Map<RawEntry, GitObject>();
+  const oidOf = new Map<RawEntry, string>();
+  const byOid = new Map<string, RawEntry>();
+  for (const entry of entries) {
     if (entry.typeNum >= 1 && entry.typeNum <= 4) {
       const type = NUM_TYPE[entry.typeNum];
       const oid = hashObject(type, entry.data);
-      return { type, data: entry.data };
+      oidOf.set(entry, oid);
+      byOid.set(oid, entry);
     }
-    let base: GitObject;
-    if (entry.typeNum === 6) {
-      const baseEntry = byOffset.get(entry.baseOffset!);
-      if (!baseEntry) throw new Error('ofs-delta base not in pack');
-      base = resolve(baseEntry, depth + 1);
+  }
+  const resolve = (entry: RawEntry, depth: number): GitObject => {
+    const hit = resolved.get(entry);
+    if (hit) return hit;
+    if (depth > 64) throw new Error('delta chain too deep');
+    let obj: GitObject;
+    if (entry.typeNum >= 1 && entry.typeNum <= 4) {
+      const type = NUM_TYPE[entry.typeNum];
+      obj = { type, data: entry.data };
     } else {
-      const fromPack = [...entries].find((e) => e.typeNum >= 1 && e.typeNum <= 4 && hashObject(NUM_TYPE[e.typeNum], e.data) === entry.baseOid);
-      if (fromPack) base = resolve(fromPack, depth + 1);
-      else if (resolveBase) {
-        const b = resolveBase(entry.baseOid!);
-        if (!b) throw new Error(`ref-delta base ${entry.baseOid} not found`);
-        base = b;
-      } else throw new Error(`ref-delta base ${entry.baseOid} not found`);
+      let base: GitObject;
+      if (entry.typeNum === 6) {
+        const baseEntry = byOffset.get(entry.baseOffset!);
+        if (!baseEntry) throw new Error('ofs-delta base not in pack');
+        base = resolve(baseEntry, depth + 1);
+      } else {
+        const fromPack = byOid.get(entry.baseOid!);
+        if (fromPack) base = resolve(fromPack, depth + 1);
+        else if (resolveBase) {
+          const b = resolveBase(entry.baseOid!);
+          if (!b) throw new Error(`ref-delta base ${entry.baseOid} not found`);
+          base = b;
+        } else throw new Error(`ref-delta base ${entry.baseOid} not found`);
+      }
+      const data = applyDelta(base.data, entry.data);
+      obj = { type: base.type, data };
     }
-    const data = applyDelta(base.data, entry.data);
-    return { type: base.type, data };
+    resolved.set(entry, obj);
+    return obj;
   };
   for (const entry of entries) {
     const obj = resolve(entry, 0);
-    out.set(hashObject(obj.type, obj.data), obj);
+    out.set(oidOf.get(entry) ?? hashObject(obj.type, obj.data), obj);
   }
   return out;
 }

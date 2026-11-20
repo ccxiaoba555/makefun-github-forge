@@ -33,7 +33,7 @@ export function createApp(): ReturnType<typeof createServer> {
       res.end();
       return;
     }
-    const payload = Buffer.from(JSON.stringify(body), 'utf8');
+    const payload = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body), 'utf8');
     headers['content-length'] = String(payload.length);
     res.writeHead(status, headers);
     res.end(payload);
@@ -55,8 +55,11 @@ export function createApp(): ReturnType<typeof createServer> {
 
   return createServer(async (req, res) => {
     try {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-      const path = url.pathname;
+      // Manual URL split: `new URL()` per request is measurable at 2,000 req/round.
+      const rawUrl = req.url ?? '/';
+      const qi = rawUrl.indexOf('?');
+      const path = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+      const query = qi < 0 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qi + 1));
       const method = req.method ?? 'GET';
 
       // healthz: no auth, plain 200
@@ -65,7 +68,7 @@ export function createApp(): ReturnType<typeof createServer> {
         return;
       }
       // git smart HTTP: /<owner>/<repo>.git/...
-      const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
+      const gitMatch = path.includes('.git/') ? /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path) : null;
       if (gitMatch) {
         const owner = decodeURIComponent(gitMatch[1]);
         const repoName = decodeURIComponent(gitMatch[2]);
@@ -75,7 +78,7 @@ export function createApp(): ReturnType<typeof createServer> {
         if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return; }
         const body = await readBody(req);
         if (rest === 'info/refs' && method === 'GET') {
-          const service = url.searchParams.get('service') ?? '';
+          const service = query.get('service') ?? '';
           if (service === 'git-upload-pack') {
             if ((req.headers['git-protocol'] ?? '') === 'version=2') {
               sendBuffer(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
@@ -173,7 +176,7 @@ export function createApp(): ReturnType<typeof createServer> {
         const ctxReq: Req = {
           method,
           path,
-          query: url.searchParams,
+          query,
           headers: {},
           body: parsed,
           bodyInvalid,
@@ -182,7 +185,7 @@ export function createApp(): ReturnType<typeof createServer> {
         const out = handleRest({ forge, baseUrl: baseUrlOf(req) }, ctxReq);
         const extra: Record<string, string> = { ...(out.headers ?? {}) };
         if (path === '/api/v3' || path === '/api/v3/') extra['X-Oauth-Scopes'] = 'repo, read:org';
-        sendJson(res, out.status, out.body, extra);
+        sendJson(res, out.status, out.rawBody ?? out.body, extra);
         return;
       }
       // anything else: 404 JSON

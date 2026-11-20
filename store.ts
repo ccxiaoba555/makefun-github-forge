@@ -207,6 +207,27 @@ export class Forge {
   nextRepoId = 5000;
   private seq = 0;
   nextSeq(): number { return ++this.seq; }
+  /** Parsed-commit cache: bench push walks the same chain on every update. */
+  private commitCache = new Map<string, CommitInfo>();
+  private tagCache = new Map<string, TagInfo>();
+  commitInfo(oid: string): CommitInfo | null {
+    const hit = this.commitCache.get(oid);
+    if (hit) return hit;
+    const obj = this.objects.get(oid);
+    if (!obj || obj.type !== 'commit') return null;
+    const info = parseCommit(obj.data);
+    this.commitCache.set(oid, info);
+    return info;
+  }
+  tagInfo(oid: string): TagInfo | null {
+    const hit = this.tagCache.get(oid);
+    if (hit) return hit;
+    const obj = this.objects.get(oid);
+    if (!obj || obj.type !== 'tag') return null;
+    const info = parseTag(obj.data);
+    this.tagCache.set(oid, info);
+    return info;
+  }
 
   putObject(type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
@@ -296,9 +317,8 @@ export class Forge {
       if (cur === ancestor) return true;
       if (seen.has(cur)) continue;
       seen.add(cur);
-      const obj = this.objects.get(cur);
-      if (!obj || obj.type !== 'commit') continue;
-      const info = parseCommit(obj.data);
+      const info = this.commitInfo(cur);
+      if (!info) continue;
       for (const p of info.parents) stack.push(p);
       if (++steps > 200000) return false;
     }
@@ -312,15 +332,16 @@ export class Forge {
     const shallow: string[] = [];
     const queue: Array<{ oid: string; d: number }> = fromOids.map((oid) => ({ oid, d: 0 }));
     const seenCommits = new Set<string>();
-    while (queue.length) {
-      const { oid, d } = queue.shift()!;
+    for (let qi = 0; qi < queue.length; qi += 1) {
+      const { oid, d } = queue[qi];
       const obj = this.objects.get(oid);
       if (!obj) continue;
       if (obj.type === 'commit') {
         if (seenCommits.has(oid)) continue;
         seenCommits.add(oid);
         objects.add(oid);
-        const info = parseCommit(obj.data);
+        const info = this.commitInfo(oid);
+        if (!info) continue;
         this.collectTree(info.tree, objects);
         if (stopAt?.has(oid)) continue; // shallow boundary: do not descend past it
         if (depth !== undefined && d + 1 >= depth) {
@@ -331,8 +352,8 @@ export class Forge {
         for (const p of info.parents) queue.push({ oid: p, d: d + 1 });
       } else if (obj.type === 'tag') {
         objects.add(oid);
-        const tag = parseTag(obj.data);
-        queue.push({ oid: tag.object, d });
+        const tag = this.tagInfo(oid);
+        if (tag) queue.push({ oid: tag.object, d });
       } else {
         objects.add(oid);
       }
@@ -356,7 +377,7 @@ export class Forge {
       const obj = this.objects.get(cur);
       if (!obj) return null;
       if (obj.type === 'commit') return cur;
-      if (obj.type === 'tag') { cur = parseTag(obj.data).object; continue; }
+      if (obj.type === 'tag') { const tag = this.tagInfo(cur); if (!tag) return null; cur = tag.object; continue; }
       return null;
     }
     return null;
@@ -371,9 +392,8 @@ export class Forge {
       const cur = stack.pop()!;
       if (seen.has(cur)) continue;
       seen.add(cur);
-      const obj = this.objects.get(cur);
-      if (!obj || obj.type !== 'commit') continue;
-      const info = parseCommit(obj.data);
+      const info = this.commitInfo(cur);
+      if (!info) continue;
       out.push({ sha: cur, info, seq: seq++ });
       for (const p of info.parents) stack.push(p);
     }

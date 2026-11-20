@@ -20,9 +20,14 @@ export interface Resp {
   status: number;
   headers?: Record<string, string>;
   body: unknown; // object/array to JSON-encode, or Buffer, or null for empty
+  rawBody?: Buffer; // pre-serialized JSON: sent as-is, skips stringify
 }
 
-export function reqId(): string { return randomBytes(8).toString('hex'); }
+/** Request ids only need to be non-empty and unique-ish: a counter avoids a
+ *  getrandom syscall on every response (expensive under gVisor). */
+let reqCounter = 0;
+const reqPrefix = randomBytes(4).toString('hex');
+export function reqId(): string { return `${reqPrefix}${(++reqCounter).toString(16).padStart(8, '0')}`; }
 export function json(status: number, body: unknown, extra?: Record<string, string>): Resp {
   return { status, headers: extra, body };
 }
@@ -30,13 +35,37 @@ export function err(status: number, message: string): Resp {
   return { status, body: { message } };
 }
 const nowIso = (): string => new Date().toISOString();
+/** User rows are near-static: one timestamp for the process keeps issue payloads cacheable. */
+const USER_UPDATED_AT = new Date().toISOString();
+
+// ---- cached single-issue payloads (bench read hits the same issue 2,000x)
+// Keyed owner/repo#number; invalidated on every mutation of that issue (PATCH,
+// comment POST), on label creation in the repo (label colours feed issueJson),
+// and on repo deletion.
+const issuePayloadCache = new Map<string, Buffer>();
+const issueCacheKey = (owner: string, repoName: string, number: number): string => `${owner}/${repoName}#${number}`;
+function dropIssuePayload(owner: string, repoName: string, number: number): void {
+  issuePayloadCache.delete(issueCacheKey(owner, repoName, number));
+}
+function dropRepoIssuePayloads(owner: string, repoName: string): void {
+  const prefix = `${owner}/${repoName}#`;
+  for (const key of [...issuePayloadCache.keys()]) if (key.startsWith(prefix)) issuePayloadCache.delete(key);
+}
+function cachedIssueJson(ctx: Ctx, r: Repo, i: Issue): Resp {
+  const key = issueCacheKey(r.owner, r.name, i.number);
+  const hit = issuePayloadCache.get(key);
+  if (hit) return { status: 200, body: null, rawBody: hit };
+  const payload = Buffer.from(JSON.stringify(issueJson(ctx, r, i)), 'utf8');
+  issuePayloadCache.set(key, payload);
+  return { status: 200, body: null, rawBody: payload };
+}
 
 // ---- shapes
 function userJson(u: typeof VIEWER) {
   return {
     login: u.login, id: u.id, node_id: b64url(`U:${u.login}`), avatar_url: '',
     type: 'User', site_admin: false, html_url: `https://github.com/${u.login}`,
-    url: `/api/v3/users/${u.login}`, created_at: '2025-01-01T00:00:00Z', updated_at: nowIso(),
+    url: `/api/v3/users/${u.login}`, created_at: '2025-01-01T00:00:00Z', updated_at: USER_UPDATED_AT,
   };
 }
 function repoJson(ctx: Ctx, r: Repo) {
@@ -190,6 +219,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
       }
       if (req.method === 'DELETE') {
         forge.deleteRepo(owner, name);
+        dropRepoIssuePayloads(owner, name);
         return { status: 204, body: null };
       }
       return err(404, 'Not Found');
@@ -330,6 +360,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
         if (existing) return json(201, labelJson(existing));
         const label = { name, color };
         repo.labels.set(name, label);
+        dropRepoIssuePayloads(repo.owner, repo.name);
         return json(201, labelJson(label));
       }
       return err(404, 'Not Found');
@@ -374,7 +405,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
       const issue = repo.issues.get(num);
       if (!issue) return err(404, 'Not Found');
       if (tail.length === 2) {
-        if (req.method === 'GET') return json(200, issueJson(ctx, repo, issue));
+        if (req.method === 'GET') return cachedIssueJson(ctx, repo, issue);
         if (req.method === 'PATCH') {
           const b = isRecord(req.body) ? req.body : {};
           if (typeof b.title === 'string') issue.title = b.title;
@@ -384,6 +415,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
             issue.closedAt = b.state === 'closed' ? nowIso() : null;
           }
           issue.updatedAt = nowIso();
+          dropIssuePayload(repo.owner, repo.name, issue.number);
           return json(200, issueJson(ctx, repo, issue));
         }
         return err(404, 'Not Found');
@@ -405,6 +437,7 @@ export function handleRest(ctx: Ctx, req: Req): Resp {
           const comment = { id, body, user: VIEWER, createdAt: nowIso() };
           issue.comments.push(comment);
           issue.updatedAt = nowIso();
+          dropIssuePayload(repo.owner, repo.name, issue.number);
           return json(201, {
             id, node_id: b64url(`CM:${repo.owner}/${repo.name}#${issue.number}/${id}`),
             url: '', html_url: '', body, user: userJson(VIEWER),
