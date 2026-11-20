@@ -18,6 +18,16 @@
 
 import { createApp } from './app.ts';
 
+/** When this process started, and the Node release it runs on: printed once at boot. */
+const STARTED_AT = new Date().toISOString();
+process.stdout.write(`[entry] started at ${STARTED_AT} on ${process.version}\n`);
+
+/** A rejected promise with no handler ends the program loudly instead of hanging the trial. */
+process.on('unhandledRejection', (reason: unknown) => {
+  process.stderr.write(`[entry] unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}\n`);
+  process.exit(1);
+});
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
@@ -85,6 +95,7 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
+  if (address.port === 8080) throw new Error('the kernel bound port 8080, which the env owns');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
   await register(address.port);
